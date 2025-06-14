@@ -1,0 +1,1367 @@
+substitutions:
+  name: sensorbox
+  friendly_name: SensorBox
+  github_user: "ralf2105"
+  github_repo: "sensorbox"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2024.6.0
+  name_add_mac_suffix: false
+  platformio_options:
+    board_build.flash_mode: dio
+    # ESP32-S2 HTTPS-Fixes
+    build_flags:
+      - "-DCONFIG_ESP_TLS_INSECURE=y"
+      - "-DCONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y"
+      - "-DCONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n"
+      - "-DCONFIG_ESP_TLS_PSK_VERIFICATION=n"
+  project:
+    name: esphome.web
+    version: "v2.5"
+  on_boot:
+    priority: -10
+    then:
+      - logger.log: "ON_BOOT: Initializing device..."
+      - script.execute: exit_standalone_script
+      - globals.set:
+          id: is_standalone_mode
+          value: "false"
+      - globals.set:
+          id: display_page
+          value: "0"
+      - globals.set:
+          id: standalone_entry_timer_start_millis
+          value: !lambda "return (float)millis();"
+      - globals.set:
+          id: standalone_check_interval_active
+          value: "true"
+      - logger.log: "ON_BOOT: Initialization complete."
+      # Versionscheck nach 30 Sekunden starten
+      - delay: 30s
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - logger.log: "Starting initial version check..."
+            - http_request.get:
+                url: https://api.github.com/repos/${github_user}/${github_repo}/releases/latest
+                request_headers:
+                  User-Agent: "ESPHome-SensorBox/2.4"
+                  Accept: "application/vnd.github.v3+json"
+                capture_response: true
+                on_response:
+                  then:
+                    - lambda: |-
+                        ESP_LOGD("version_check", "GitHub API response received, status: %d", response->status_code);
+                        
+                        if (response->status_code != 200) {
+                          ESP_LOGW("version_check", "GitHub API returned status: %d", response->status_code);
+                          return;
+                        }
+                        
+                        if (!body.empty()) {
+                          std::string response_body = body;
+                          ESP_LOGD("version_check", "Response body length: %d", response_body.length());
+                          
+                          // NEUE STRATEGIE: Extrahiere Version aus html_url statt tag_name
+                          size_t html_start = response_body.find("\"html_url\":\"https://github.com/");
+                          if (html_start != std::string::npos) {
+                            size_t tag_start = response_body.find("/releases/tag/", html_start);
+                            if (tag_start != std::string::npos) {
+                              tag_start += 14; // Length of "/releases/tag/"
+                              size_t tag_end = response_body.find("\"", tag_start);
+                              if (tag_end != std::string::npos) {
+                                std::string latest_version = response_body.substr(tag_start, tag_end - tag_start);
+                                ESP_LOGI("version_check", "Latest GitHub version: %s", latest_version.c_str());
+                                
+                                id(latest_github_version) = latest_version;
+                                
+                                std::string current_version = ESPHOME_PROJECT_VERSION;
+                                ESP_LOGI("version_check", "Current version: %s", current_version.c_str());
+                                
+                                bool new_update_available = false;
+                                if (latest_version != current_version && !latest_version.empty()) {
+                                  std::string latest_num = latest_version;
+                                  std::string current_num = current_version;
+                                  
+                                  // Remove 'v' prefix if present
+                                  if (latest_num.length() > 0 && latest_num[0] == 'v') {
+                                    latest_num = latest_num.substr(1);
+                                  }
+                                  if (current_num.length() > 0 && current_num[0] == 'v') {
+                                    current_num = current_num.substr(1);
+                                  }
+                                  
+                                  new_update_available = (latest_num > current_num);
+                                }
+                                
+                                id(update_available) = new_update_available;
+                                
+                                if (new_update_available) {
+                                  ESP_LOGI("version_check", "Update available! Current: %s, Latest: %s", 
+                                           current_version.c_str(), latest_version.c_str());
+                                } else {
+                                  ESP_LOGI("version_check", "No update available. Current version is up to date.");
+                                }
+                              }
+                            }
+                          } else {
+                            ESP_LOGW("version_check", "Could not parse GitHub API response - no html_url found");
+                          }
+                        } else {
+                          ESP_LOGW("version_check", "GitHub API request returned empty body");
+                        }
+
+esp32:
+  board: esp32-s2-saola-1
+  framework:
+    type: arduino
+
+logger:
+  level: WARN
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+improv_serial:
+
+psram:
+  speed: 80MHz
+
+wifi:
+  ap:
+    ssid: "Sensorbox_Backup_WiFi"
+    password: "123456789#!"
+
+  on_connect:
+    then:
+      - logger.log: "WIFI_EVENT: Connected to STA."
+      - globals.set:
+          id: is_standalone_mode
+          value: "false"
+      - globals.set:
+          id: standalone_check_interval_active
+          value: "false"
+      - globals.set:
+          id: standalone_entry_timer_start_millis
+          value: "0"
+      - if:
+          condition:
+            lambda: "return id(display_smiley) == 0;"
+          then:
+            - globals.set:
+                id: mood_indicators_active
+                value: "false"
+            - logger.log: "ON_CONNECT: display_smiley is OFF, setting mood_indicators_active to false."
+      - globals.set:
+          id: display_page
+          value: "0"
+      # Versionscheck nach WiFi-Verbindung
+      - delay: 10s
+      - http_request.get:
+          url: https://api.github.com/repos/${github_user}/${github_repo}/releases/latest
+          request_headers:
+            User-Agent: "ESPHome-SensorBox/2.4"
+            Accept: "application/vnd.github.v3+json"
+          capture_response: true
+          on_response:
+            then:
+              - lambda: |-
+                  ESP_LOGD("version_check", "GitHub API response on WiFi connect, status: %d", response->status_code);
+                  
+                  if (response->status_code != 200) {
+                    ESP_LOGW("version_check", "GitHub API returned status: %d", response->status_code);
+                    return;
+                  }
+                  
+                  if (!body.empty()) {
+                    std::string response_body = body;
+                    
+                    // NEUE STRATEGIE: html_url statt tag_name
+                    size_t html_start = response_body.find("\"html_url\":\"https://github.com/");
+                    if (html_start != std::string::npos) {
+                      size_t tag_start = response_body.find("/releases/tag/", html_start);
+                      if (tag_start != std::string::npos) {
+                        tag_start += 14;
+                        size_t tag_end = response_body.find("\"", tag_start);
+                        if (tag_end != std::string::npos) {
+                          std::string latest_version = response_body.substr(tag_start, tag_end - tag_start);
+                          id(latest_github_version) = latest_version;
+                          
+                          std::string current_version = ESPHOME_PROJECT_VERSION;
+                          bool new_update_available = false;
+                          if (latest_version != current_version && !latest_version.empty()) {
+                            std::string latest_num = latest_version;
+                            std::string current_num = current_version;
+                            
+                            if (latest_num.length() > 0 && latest_num[0] == 'v') {
+                              latest_num = latest_num.substr(1);
+                            }
+                            if (current_num.length() > 0 && current_num[0] == 'v') {
+                              current_num = current_num.substr(1);
+                            }
+                            
+                            new_update_available = (latest_num > current_num);
+                          }
+                          
+                          id(update_available) = new_update_available;
+                        }
+                      }
+                    }
+                  }
+  on_disconnect:
+    then:
+      - logger.log: "WIFI_EVENT: Disconnected from STA."
+      - if:
+          condition:
+            and:
+              - not:
+                  lambda: "return id(is_standalone_mode);"
+              - not:
+                  lambda: "return id(standalone_check_interval_active) && (id(standalone_entry_timer_start_millis) > 0);"
+          then:
+            - logger.log: "WIFI_EVENT: Starting standalone mode timer due to disconnect."
+            - globals.set:
+                id: standalone_entry_timer_start_millis
+                value: !lambda "return (float)millis();"
+            - globals.set:
+                id: standalone_check_interval_active
+                value: "true"
+
+captive_portal:
+
+time:
+  - platform: sntp
+    id: my_time
+    timezone: "Europe/Berlin"
+    servers:
+      - 0.pool.ntp.org
+      - 1.pool.ntp.org
+
+dashboard_import:
+  package_import_url: github://esphome/firmware/esphome-web/esp32s2.yaml@main
+  import_full_config: true
+
+web_server:
+  port: 80
+  include_internal: false
+  local: true
+
+debug:
+  update_interval: 5s
+
+http_request:
+  useragent: "ESPHome-SensorBox/2.4 (ESP32-S2)"
+  timeout: 30s
+  verify_ssl: false
+  follow_redirects: false
+  id: http_request_data
+
+globals:
+  - id: dbright
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: time_zone_offset
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: use_12h_format
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: display_time
+    type: int
+    restore_value: true
+    initial_value: "1"
+  - id: display_smiley
+    type: int
+    restore_value: true
+    initial_value: "0"
+  - id: mood_indicators_active
+    type: bool
+    restore_value: true
+    initial_value: "false"
+  - id: long_press_action_fired
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: display_page
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: last_aht10_update
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: last_bmp280_update
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: last_scd4x_update
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: last_sgp30_update
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: last_pms_update
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: boot_millis
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: tx_power_set
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: is_standalone_mode
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: standalone_entry_timer_start_millis
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: standalone_check_interval_active
+    type: bool
+    restore_value: no
+    initial_value: "true"
+  - id: latest_github_version
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: update_available
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+interval:
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: "return id(standalone_check_interval_active);"
+              - lambda: "return !id(wifi_status).state;"
+              - lambda: "return !id(is_standalone_mode);"
+              - lambda: "return id(standalone_entry_timer_start_millis) > 0;"
+          then:
+            - if:
+                condition:
+                  lambda: "return (millis() - (unsigned long)id(standalone_entry_timer_start_millis)) > (10 * 60 * 1000);"
+                then:
+                  - logger.log: "STANDALONE_TIMER: 10 minutes elapsed. Entering Standalone Mode."
+                  - globals.set:
+                      id: is_standalone_mode
+                      value: "true"
+                  - globals.set:
+                      id: standalone_check_interval_active
+                      value: "false"
+                  - script.execute: enter_standalone_script
+
+ 
+  - interval: 24h
+    then:
+      - if:
+          condition:
+            and:
+              - wifi.connected:
+              - not:
+                  lambda: "return id(is_standalone_mode);"
+          then:
+            - logger.log: "Performing daily version check..."
+            - http_request.get:
+                url: https://api.github.com/repos/${github_user}/${github_repo}/releases/latest
+                request_headers:
+                  User-Agent: "ESPHome-SensorBox/2.4"
+                  Accept: "application/vnd.github.v3+json"
+                capture_response: true
+                on_response:
+                  then:
+                    - lambda: |-
+                        if (response->status_code != 200) {
+                          ESP_LOGW("version_check", "Daily check - GitHub API returned status: %d", response->status_code);
+                          return;
+                        }
+                        
+                        if (!body.empty()) {
+                          std::string response_body = body;
+                          
+                          // NEUE STRATEGIE: html_url statt tag_name
+                          size_t html_start = response_body.find("\"html_url\":\"https://github.com/");
+                          if (html_start != std::string::npos) {
+                            size_t tag_start = response_body.find("/releases/tag/", html_start);
+                            if (tag_start != std::string::npos) {
+                              tag_start += 14;
+                              size_t tag_end = response_body.find("\"", tag_start);
+                              if (tag_end != std::string::npos) {
+                                std::string latest_version = response_body.substr(tag_start, tag_end - tag_start);
+                                id(latest_github_version) = latest_version;
+                                
+                                std::string current_version = ESPHOME_PROJECT_VERSION;
+                                bool new_update_available = false;
+                                if (latest_version != current_version && !latest_version.empty()) {
+                                  std::string latest_num = latest_version;
+                                  std::string current_num = current_version;
+                                  
+                                  if (latest_num.length() > 0 && latest_num[0] == 'v') {
+                                    latest_num = latest_num.substr(1);
+                                  }
+                                  if (current_num.length() > 0 && current_num[0] == 'v') {
+                                    current_num = current_num.substr(1);
+                                  }
+                                  
+                                  new_update_available = (latest_num > current_num);
+                                }
+                                
+                                id(update_available) = new_update_available;
+                              }
+                            }
+                          }
+                        }
+
+script:
+  - id: enter_standalone_script
+    then:
+      - logger.log: "SCRIPT: enter_standalone_script - Disabling WiFi..."
+      - wifi.disable:
+      - delay: 100ms
+      - logger.log: "SCRIPT: enter_standalone_script - wifi.disable called."
+  - id: exit_standalone_script
+    then:
+      - logger.log: "SCRIPT: exit_standalone_script - Enabling WiFi..."
+      - wifi.enable:
+      - logger.log: "SCRIPT: exit_standalone_script - wifi.enable called."
+  - id: button_long_press_check_script
+    mode: single
+    then:
+      - delay: 3000ms
+      - if:
+          condition:
+            binary_sensor.is_on: top_btn
+          then:
+            - globals.set:
+                id: long_press_action_fired
+                value: "true"
+            - if:
+                condition:
+                  lambda: "return id(is_standalone_mode);"
+                then:
+                  - globals.set:
+                      id: mood_indicators_active
+                      value: !lambda "return !id(mood_indicators_active);"
+                  - lambda: |-
+                      if (id(mood_indicators_active)) {
+                        ESP_LOGD("button", "Long Press (held) - STANDALONE: Mood indicators ON");
+                      } else {
+                        ESP_LOGD("button", "Long Press (held) - STANDALONE: Mood indicators OFF");
+                      }
+                else:
+                  - logger.log: "Long Press (held) - ONLINE: No action on mood_indicators via physical button."
+            - logger.log: "Long Press (held) action processed."
+
+output:
+  - platform: ledc
+    pin: GPIO15
+    id: backlight_pwm
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: back_light
+    restore_mode: ALWAYS_ON
+
+button:
+  - platform: template
+    name: "Enter Standalone Mode"
+    id: force_standalone_button
+    on_press:
+      then:
+        - logger.log: "UI_BUTTON: 'Enter Standalone Mode' pressed."
+        - globals.set:
+            id: is_standalone_mode
+            value: "true"
+        - globals.set:
+            id: standalone_check_interval_active
+            value: "false"
+        - globals.set:
+            id: standalone_entry_timer_start_millis
+            value: "0"
+        - globals.set:
+            id: display_page
+            value: "0"
+        - script.execute: enter_standalone_script
+
+  - platform: template
+    name: "GitHub Repository"
+    id: github_button
+    icon: "mdi:github"
+    on_press:
+      then:
+        - logger.log: 
+            format: "=== GitHub Repository ==="
+            level: ERROR
+        - logger.log: 
+            format: "Link: https://github.com/ralf2105/sensorbox"
+            level: ERROR
+        - logger.log: 
+            format: "Kopiere den Link und öffne ihn in deinem Browser"
+            level: ERROR
+
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO13
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    id: top_btn
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_press:
+      then:
+        - globals.set:
+            id: long_press_action_fired
+            value: "false"
+        - script.execute: button_long_press_check_script
+        - logger.log: "Button pressed: long_press_action_fired=false, script for long press (mood) started."
+    on_release:
+      then:
+        - script.stop: button_long_press_check_script
+        - if:
+            condition:
+              lambda: 'return !id(long_press_action_fired);'
+            then:
+              - lambda: |-
+                  const int STATE_OFF    = 0;
+                  const int STATE_LOW    = 1;
+                  const int STATE_MEDIUM = 2;
+                  const int STATE_HIGH   = 3;
+                  switch(id(dbright)) {
+                    case STATE_OFF:
+                      id(dbright) = STATE_HIGH;
+                      id(back_light).turn_on().set_brightness(1.00).perform();
+                      break;
+                    case STATE_HIGH:
+                      id(dbright) = STATE_MEDIUM;
+                      id(back_light).turn_on().set_brightness(0.77).perform();
+                      break;
+                    case STATE_MEDIUM:
+                      id(dbright) = STATE_LOW;
+                      id(back_light).turn_on().set_brightness(0.33).perform();
+                      break;
+                    default:
+                      id(dbright) = STATE_OFF;
+                      id(back_light).turn_off().perform();
+                      break;
+                  }
+                  ESP_LOGD("button", "Short click (on_release): Brightness set to %d", id(dbright));
+            else:
+              - globals.set:
+                  id: long_press_action_fired
+                  value: "false"
+              - logger.log: "Button released after long press action. Flag reset."
+
+  - platform: status
+    name: "WiFi Status"
+    id: wifi_status
+
+  - platform: template
+    name: "Update Available"
+    id: update_available_sensor
+    lambda: |-
+      return id(update_available);
+
+font:
+  - file: "gfonts://Rubik@300"
+    id: font_label_14
+    size: 14
+    bpp: 4
+    glyphs: [
+      "0","1","2","3","4","5","6","7","8","9","µ","³","/","°","%",",",".","(",")","-","_",
+      A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y,Z," ",
+      a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z
+    ]
+  - file: "gfonts://Rubik@400"
+    id: font_value_30
+    size: 24
+    bpp: 4
+    glyphs: [
+      "0","1","2","3","4","5","6","7","8","9",".",":"
+    ]
+  - file: "gfonts://Orbitron"
+    id: font_heading_36
+    size: 36
+    bpp: 4
+    glyphs: [
+      "2","C","O","P","V","a","c","e","i","l","r","s","t"
+    ]
+  - file: "gfonts://Rubik@300"
+    id: font_label_small
+    size: 12
+    bpp: 4
+    glyphs: [
+      "R", "H", "%",
+      "0","1","2","3","4","5","6","7","8","9",".","-","k","P","a","p","m","b", "µ", "g", "/","³", "C"
+    ]
+  - file: "gfonts://Rubik@300"
+    id: font_graph_axis
+    size: 10
+    bpp: 4
+    glyphs: ["0","1","2","3","4","5","6","7","8","9",".","-","k","P","a","p","m","b", "µ", "g", "/","³", "C", "%"]
+
+color:
+  - id: white
+    hex: FFFFFF
+  - id: grey
+    hex: AAAAAA
+  - id: light_grey
+    hex: CCCCCC
+  - id: blue
+    hex: "007BFF"
+  - id: green
+    hex: "28A745"
+  - id: magenta
+    hex: FF00FF
+  - id: cyan
+    hex: "17A2B8"
+  - id: orange
+    hex: FD7E14
+  - id: yellow
+    hex: FFFA72
+  - id: red
+    hex: FF1616
+  - id: purple
+    hex: FF16e0
+  - id: black
+    hex: "000000"
+
+text_sensor:
+  - platform: template
+    name: "Latest GitHub Version"
+    id: github_version_sensor
+    lambda: |-
+      return id(latest_github_version);
+
+sensor:
+  - platform: homeassistant
+    id: ha_timezone_offset
+    entity_id: sensor.timezone_offset
+    internal: true
+
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    id: wifi_rssi
+    update_interval: 10s
+
+  - platform: uptime
+    name: "Uptime"
+    id: uptime_sensor
+    update_interval: 5s
+    disabled_by_default: true
+
+  - platform: debug
+    free:
+      name: "Heap Free"
+      id: heap_free
+      disabled_by_default: true
+    loop_time:
+      name: "Loop Time"
+      id: loop_time
+      disabled_by_default: true
+
+  - platform: aht10
+    i2c_id: i2c_main
+    variant: AHT20
+    temperature:
+      name: "AHT20 Temperature"
+      id: temp_aht10
+      on_value:
+        then:
+          - lambda: |-
+              id(last_aht10_update) = id(my_time).now().timestamp;
+    humidity:
+      name: "AHT20 Humidity"
+      id: hum_aht10
+    update_interval: 10s
+
+  - platform: bmp280_i2c
+    address: 0x77
+    i2c_id: i2c_main
+    temperature:
+      name: "BMP280 Temperature"
+      id: temp_bmp280
+      oversampling: 16x
+      on_value:
+        then:
+          - lambda: |-
+              id(last_bmp280_update) = id(my_time).now().timestamp;
+    pressure:
+      name: "BMP280 Pressure"
+      id: pres_bmp280
+    update_interval: 10s
+
+  - platform: scd4x
+    i2c_id: i2c_main
+    co2:
+      name: "SCD40 CO2"
+      id: co2_scd40
+      on_value:
+        then:
+          - lambda: |-
+              id(last_scd4x_update) = id(my_time).now().timestamp;
+    update_interval: 10s
+
+  - platform: sgp30
+    i2c_id: i2c_main
+    address: 0x58
+    eco2:
+      name: "SGP30 eCO2"
+      id: eco2_sgp30
+      disabled_by_default: true
+    tvoc:
+      name: "SGP30 TVOC"
+      id: tvoc_sgp30
+      on_value:
+        then:
+          - lambda: |-
+              id(last_sgp30_update) = id(my_time).now().timestamp;
+      filters:
+        - exponential_moving_average:
+            send_every: 1
+            alpha: 0.4
+    store_baseline: yes
+    update_interval: 10s  # OPTIMIERT: Von 5s auf 10s erhöht für weniger CPU-Last
+    compensation:
+      humidity_source: hum_aht10
+      temperature_source: temp_aht10
+
+  - platform: pmsx003
+    type: PMSX003
+    update_interval: 60s
+    uart_id: uart_pms
+    pm_1_0:
+      name: "PMS Particulate Matter <1.0µm Concentration"
+      id: pm1_pms
+      on_value:
+        then:
+          - lambda: |-
+              id(last_pms_update) = id(my_time).now().timestamp;
+    pm_2_5:
+      name: "PMS Particulate Matter <2.5µm Concentration"
+      id: pm25_pms
+    pm_10_0:
+      name: "PMS Particulate Matter <10.0µm Concentration"
+      id: pm10_pms
+
+number:
+  - platform: template
+    name: "Time Zone Offset"
+    id: tz_offset
+    min_value: -12
+    max_value: 14
+    step: 1
+    unit_of_measurement: "h"
+    lambda: |-
+      return id(time_zone_offset);
+    set_action:
+      - lambda: |-
+          id(time_zone_offset) = x;
+
+switch:
+  - platform: template
+    name: "12h Format (AM/PM)"
+    id: format_12h
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: |-
+      return (id(use_12h_format) == 1);
+    turn_on_action:
+      - lambda: |-
+          id(use_12h_format) = 1;
+    turn_off_action:
+      - lambda: |-
+          id(use_12h_format) = 0;
+
+  - platform: template
+    name: "Display Time"
+    id: sw_display_time
+    restore_mode: RESTORE_DEFAULT_ON
+    lambda: |-
+      return (id(display_time) == 1);
+    turn_on_action:
+      - lambda: |-
+          id(display_time) = 1;
+    turn_off_action:
+      - lambda: |-
+          id(display_time) = 0;
+
+  - platform: template
+    name: "Display Smiley"
+    id: sw_display_smiley
+    restore_mode: RESTORE_DEFAULT_OFF
+    lambda: |-
+      return (id(display_smiley) == 1);
+    turn_on_action:
+      - globals.set:
+          id: display_smiley
+          value: "1"
+      - globals.set:
+          id: mood_indicators_active
+          value: "true"
+      - logger.log: "Switch 'Display Smiley' ON: display_smiley=1, mood_indicators_active=true"
+    turn_off_action:
+      - globals.set:
+          id: display_smiley
+          value: "0"
+      - globals.set:
+          id: mood_indicators_active
+          value: "false"
+      - logger.log: "Switch 'Display Smiley' OFF: display_smiley=0, mood_indicators_active=false"
+
+  - platform: template
+    name: "Show Graph Page (1h)"
+    id: sw_display_graph_page
+    lambda: "return id(display_page) == 1;"
+    turn_on_action:
+      - globals.set:
+          id: display_page
+          value: "1"
+    turn_off_action:
+      - globals.set:
+          id: display_page
+          value: "0"
+  - platform: template
+    name: "Show Graph Page (24h)"
+    id: sw_display_graph_page_24h
+    lambda: "return id(display_page) == 2;"
+    turn_on_action:
+      - globals.set:
+          id: display_page
+          value: "2"
+    turn_off_action:
+      - globals.set:
+          id: display_page
+          value: "0"
+
+display:
+  - platform: ili9xxx
+    model: ILI9341
+    cs_pin: GPIO03
+    dc_pin: GPIO04
+    reset_pin: GPIO06
+    transform:
+      mirror_y: true
+    color_order: bgr
+    invert_colors: false
+    dimensions:
+      width: 240
+      height: 320
+    lambda: |-
+      // Helper functions
+      auto draw_big_wifi = [&](int cx, int cy, Color c, int bars) {
+        if (bars > 0) { it.filled_circle(cx, cy, 2, c); }
+        int arcs[3] = {8, 14, 20};
+        int thickness = 2;
+        for (int i = 0; i < bars; i++) {
+          for (int t = 0; t < thickness; t++) {
+            int rr = arcs[i] + t;
+            for (int deg = 30; deg <= 150; deg++){
+              float rad = deg * 3.14159f / 180.0f;
+              int px = cx + (int)(rr * cosf(rad));
+              int py = cy - (int)(rr * sinf(rad));
+              it.draw_pixel_at(px, py, c);
+            }
+          }
+        }
+      };
+
+      auto draw_smooth_filled_circle = [&](int cx, int cy, int r, Color c) {
+        for (int dy = -r; dy <= r; dy++) {
+          int dx_int = round(sqrtf(r * r - dy * dy));
+          it.line(cx - dx_int, cy + dy, cx + dx_int, cy + dy, c);
+        }
+      };
+
+      auto draw_smiley = [&](int x, int y, Color face_color, const char* mood) {
+        int r = 20;
+        it.filled_circle(x, y, r, id(white));
+        it.filled_circle(x, y, r - 2, face_color);
+        draw_smooth_filled_circle(x - 8, y - 8, 4, id(black));
+        draw_smooth_filled_circle(x + 8, y - 8, 4, id(black));
+
+        if (strcmp(mood, "happy") == 0) {
+          it.line(x - 8, y + 4, x - 2, y + 8, id(black)); it.line(x - 8, y + 5, x - 2, y + 9, id(black));
+          it.line(x - 2, y + 8, x + 2, y + 8, id(black)); it.line(x - 2, y + 9, x + 2, y + 9, id(black));
+          it.line(x + 2, y + 8, x + 8, y + 4, id(black)); it.line(x + 2, y + 9, x + 8, y + 5, id(black));
+        } else if (strcmp(mood, "neutral") == 0) {
+          it.line(x - 8, y + 8, x + 8, y + 8, id(black));
+          it.line(x - 8, y + 9, x + 8, y + 9, id(black));
+        } else {
+          it.line(x - 8, y + 8, x - 2, y + 4, id(black)); it.line(x - 8, y + 9, x - 2, y + 5, id(black));
+          it.line(x - 2, y + 4, x + 2, y + 4, id(black)); it.line(x - 2, y + 5, x + 2, y + 5, id(black));
+          it.line(x + 2, y + 4, x + 8, y + 8, id(black)); it.line(x + 2, y + 5, x + 8, y + 9, id(black));
+        }
+      };
+
+      // Helper für Update-Pfeil (kleiner, näher an Version, langer Strich beginnt auf Schrifthöhe)
+      auto draw_update_arrow = [&](int x, int y, Color c) {
+        // Pfeil nach oben ↑ - kleiner (10px hoch, 5px breit)
+        int height = 10;  // Kleiner als Schriftgröße
+        int width = 5;    // Kompakte Breite
+        
+        // Hauptlinie (langer Strich beginnt bei y - das ist die Schrifthöhe)
+        it.line(x, y, x, y - height, c);          
+        it.line(x - 1, y - 1, x - 1, y - height + 1, c);   
+        it.line(x + 1, y - 1, x + 1, y - height + 1, c);   
+        
+        // Pfeilspitze (proportional kleiner)
+        it.line(x - width/2, y - height + 3, x, y - height, c);  // Linke Spitze
+        it.line(x + width/2, y - height + 3, x, y - height, c);  // Rechte Spitze
+        it.line(x - 2, y - height + 4, x, y - height + 1, c);   // Verstärkung links innen
+        it.line(x + 2, y - height + 4, x, y - height + 1, c);   // Verstärkung rechts innen
+      };
+
+      auto color_sensor = [&](float val, float t1, float t2, float t3, float t4, Color good_color) -> Color {
+          if (isnan(val)) return id(grey);
+          if (val > t4) return id(purple);
+          if (val > t3) return id(red);
+          if (val > t2) return id(orange);
+          if (val > t1) return id(yellow);
+          return good_color;
+      };
+
+      it.fill(id(black));
+      auto w = it.get_width(); auto h = it.get_height();
+      auto fl14 = id(font_label_14); auto fv30 = id(font_value_30); auto fh36 = id(font_heading_36);
+      auto f_graph_label = id(font_label_small);
+
+      bool wifi_connected_status = (WiFi.status() == WL_CONNECTED);
+
+      if (id(display_page) == 0) { // Main Page
+        // Temperature and Humidity display
+        float temp = NAN; if (id(temp_aht10).has_state()) temp = id(temp_aht10).state;
+        float hum = NAN; if (id(hum_aht10).has_state()) hum = id(hum_aht10).state;
+
+        // Time display logic
+        if (wifi_connected_status && (id(my_time).now().year > 2000) && (id(display_time) == 1) && !id(is_standalone_mode)) {
+            auto now_time = id(my_time).now();
+            int offset_val = id(time_zone_offset);
+            time_t current_time_utc = now_time.timestamp;
+            time_t local_time_epoch = current_time_utc + (offset_val * 3600);
+            struct tm *local_tm = gmtime(&local_time_epoch);
+            char formatted_time[10];
+            if (id(use_12h_format) == 1) {
+              int hour12 = local_tm->tm_hour % 12; if (hour12 == 0) hour12 = 12;
+              sprintf(formatted_time, "%02d:%02d", hour12, local_tm->tm_min);
+            } else {
+              sprintf(formatted_time, "%02d:%02d", local_tm->tm_hour, local_tm->tm_min);
+            }
+            if (!isnan(temp)) it.printf(5, 32, fv30, id(white), TextAlign::BOTTOM_LEFT, "%.1f", temp);
+            it.print(54, 30, fl14, id(white), TextAlign::BOTTOM_LEFT, "°C");
+            it.print(w - 55, 20, id(font_label_small), id(white), TextAlign::BOTTOM_RIGHT, "RH");
+            it.print(w - 55, 30, id(font_label_small), id(white), TextAlign::BOTTOM_RIGHT, "%");
+            if (!isnan(hum)) it.printf(w - 5, 32, fv30, id(white), TextAlign::BOTTOM_RIGHT, "%.1f", hum);
+            it.printf(w/2, 32, fv30, id(white), TextAlign::BOTTOM_CENTER, "%s", formatted_time);
+        } else {
+            if (!isnan(temp)) it.printf(90, 32, fv30, id(white), TextAlign::BOTTOM_RIGHT, "%.1f", temp);
+            it.printf(90, 30, fl14, id(grey), TextAlign::BOTTOM_LEFT, "°C");
+            it.print(197, 18, fl14, id(grey), TextAlign::BOTTOM_LEFT, "RH");
+            it.print(197, 30, fl14, id(grey), TextAlign::BOTTOM_LEFT, "%");
+            if (!isnan(hum)) it.printf(197, 32, fv30, id(white), TextAlign::BOTTOM_RIGHT, "%.1f", hum);
+        }
+        int current_y_pos = 30;
+
+        // Particles (PMS)
+        float pm1_val  = NAN, pm25_val = NAN, pm10_val = NAN;
+        if(id(pm1_pms).has_state()) pm1_val = id(pm1_pms).state; if(id(pm25_pms).has_state()) pm25_val = id(pm25_pms).state; if(id(pm10_pms).has_state()) pm10_val = id(pm10_pms).state;
+        if (id(last_pms_update) > 0) {
+            it.line(0, current_y_pos, w, current_y_pos, id(white));
+            it.print(2, current_y_pos + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, "Particles");
+            it.print(w - 2, current_y_pos + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, "µg/m³");
+            int ix = 0;
+
+            Color pm1_c  = color_sensor(pm1_val,  5, 10, 15, 25, id(green));
+            Color pm25_c = color_sensor(pm25_val, 5, 10, 15, 25, id(green));
+            Color pm10_c = color_sensor(pm10_val, 15, 45, 60, 80, id(green));
+
+            it.printf(w/6*(1+ix*2), current_y_pos + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "PM1");
+            if(!isnan(pm1_val)) it.printf(w/6*(1+ix*2), current_y_pos + 53, fv30, pm1_c, TextAlign::TOP_CENTER, "%.0f", pm1_val); else it.printf(w/6*(1+ix*2), current_y_pos + 53, fv30, id(grey), TextAlign::TOP_CENTER, "-"); ix++;
+            it.printf(w/6*(1+ix*2), current_y_pos + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "PM2.5");
+            if(!isnan(pm25_val)) it.printf(w/6*(1+ix*2), current_y_pos + 53, fv30, pm25_c, TextAlign::TOP_CENTER, "%.0f", pm25_val); else it.printf(w/6*(1+ix*2), current_y_pos + 53, fv30, id(grey), TextAlign::TOP_CENTER, "-"); ix++;
+            it.printf(w/6*(1+ix*2), current_y_pos + 58, fl14, id(grey), TextAlign::BOTTOM_CENTER, "PM10");
+            if(!isnan(pm10_val)) it.printf(w/6*(1+ix*2), current_y_pos + 53, fv30, pm10_c, TextAlign::TOP_CENTER, "%.0f", pm10_val); else it.printf(w/6*(1+ix*2), current_y_pos + 53, fv30, id(grey), TextAlign::TOP_CENTER, "-");
+            current_y_pos += 88;
+        }
+
+        // CO2 (SCD40)
+        float co2 = NAN; if(id(co2_scd40).has_state()) co2 = id(co2_scd40).state;
+        if (id(last_scd4x_update) > 0) {
+            Color co2_color_val = color_sensor(co2, 600, 800, 1500, 2500, id(green));
+            Color co2_face_color = id(green); const char* co2_mood = "happy";
+            if (co2 > 2500) { co2_face_color = id(purple); co2_mood = "sad"; }
+            else if (co2 > 1500) { co2_face_color = id(red); co2_mood = "sad"; }
+            else if (co2 > 800)  { co2_face_color = id(orange); co2_mood = "neutral"; }
+            else if (co2 > 600)  { co2_face_color = id(yellow); co2_mood = "neutral"; }
+
+            it.line(0, current_y_pos, w, current_y_pos, id(white));
+            it.print(2, current_y_pos + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, "CO2");
+            it.print(w - 2, current_y_pos + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, "ppm");
+            int left_x = 10;
+            if(!isnan(co2)) it.printf(left_x, current_y_pos + 57, fv30, co2_color_val, TextAlign::TOP_LEFT, "%.0f", co2); else it.printf(left_x, current_y_pos + 57, fv30, id(grey), TextAlign::TOP_LEFT, "-");
+            it.printf(left_x, current_y_pos + 60, fl14, id(grey), TextAlign::BOTTOM_LEFT, "SCD40");
+
+            bool should_draw_mood_indicator = (id(is_standalone_mode) && id(mood_indicators_active)) ||
+                                              (!id(is_standalone_mode) && id(display_smiley) == 1 && id(mood_indicators_active));
+            if (should_draw_mood_indicator) { draw_smiley(130, current_y_pos + 55, co2_face_color, co2_mood); }
+            current_y_pos += 88;
+        }
+
+        // VOC (SGP30)
+        float voc_sgp_val = NAN; if(id(tvoc_sgp30).has_state()) voc_sgp_val = id(tvoc_sgp30).state;
+        if (id(last_sgp30_update) > 0) {
+            it.line(0, current_y_pos, w, current_y_pos, id(white));
+            it.print(2, current_y_pos + 22, fh36, id(light_grey), TextAlign::CENTER_LEFT, "VOC");
+            it.print(w - 2, current_y_pos + 31, fl14, id(grey), TextAlign::CENTER_RIGHT, "ppb");
+            Color voc_face_color = id(green); const char* voc_mood = "happy";
+            if (voc_sgp_val > 900) { voc_face_color = id(purple); voc_mood = "sad"; }
+            else if (voc_sgp_val > 600) { voc_face_color = id(red);    voc_mood = "sad"; }
+            else if (voc_sgp_val > 300) { voc_face_color = id(orange); voc_mood = "neutral"; }
+            else if (voc_sgp_val > 100) { voc_face_color = id(yellow); voc_mood = "neutral"; }
+
+            int left_x = 10;
+            Color voc_color_val = color_sensor(voc_sgp_val, 100, 300, 600, 900, id(green));
+            if(!isnan(voc_sgp_val)) it.printf(left_x, current_y_pos + 57, fv30, voc_color_val, TextAlign::TOP_LEFT, "%.0f", voc_sgp_val); else it.printf(left_x, current_y_pos + 57, fv30, id(grey), TextAlign::TOP_LEFT, "-");
+            it.printf(left_x, current_y_pos + 60, fl14, id(grey), TextAlign::BOTTOM_LEFT, "SGP30");
+
+            bool should_draw_mood_indicator = (id(is_standalone_mode) && id(mood_indicators_active)) ||
+                                              (!id(is_standalone_mode) && id(display_smiley) == 1 && id(mood_indicators_active));
+            if (should_draw_mood_indicator) { draw_smiley(130, current_y_pos + 55, voc_face_color, voc_mood); }
+        }
+      } else if (id(display_page) == 1 || id(display_page) == 2) { // Graph Pages
+          int graph_y_start = 20;
+          int graph_height = 50;
+          int graph_spacing = 6;
+          int label_x = 5;
+          int graph_x = w - 151 - 5;
+
+          if (id(display_page) == 1) {
+            it.printf(w/2, 2, fl14, id(white), TextAlign::TOP_CENTER, "LAST HOUR");
+            graph_y_start = 20;
+            it.printf(label_x, graph_y_start + graph_height/2, fl14, id(blue), TextAlign::CENTER_LEFT, "TEMP");
+            it.printf(label_x + 55, graph_y_start + 3, f_graph_label, id(white), TextAlign::TOP_LEFT, "%.0f", 30.0);
+            it.printf(label_x + 55, graph_y_start + graph_height - 3, f_graph_label, id(white), TextAlign::BOTTOM_LEFT, "%.0f", 15.0);
+            it.graph(graph_x, graph_y_start, id(temperature_graph));
+            graph_y_start += graph_height + graph_spacing;
+            
+            it.printf(label_x, graph_y_start + graph_height/2, fl14, id(green), TextAlign::CENTER_LEFT, "HUM");
+            it.printf(label_x + 55, graph_y_start + 3, f_graph_label, id(white), TextAlign::TOP_LEFT, "%.0f%%", 70.0);
+            it.printf(label_x + 55, graph_y_start + graph_height - 3, f_graph_label, id(white), TextAlign::BOTTOM_LEFT, "%.0f%%", 30.0);
+            it.graph(graph_x, graph_y_start, id(humidity_graph));
+            graph_y_start += graph_height + graph_spacing;
+            
+            it.printf(label_x, graph_y_start + graph_height/2, fl14, id(yellow), TextAlign::CENTER_LEFT, "PM2.5");
+            it.printf(label_x + 55, graph_y_start + 3, f_graph_label, id(white), TextAlign::TOP_LEFT, "%.0f", 50.0);
+            it.printf(label_x + 55, graph_y_start + graph_height - 3, f_graph_label, id(white), TextAlign::BOTTOM_LEFT, "%.0f", 1.0);
+            it.graph(graph_x, graph_y_start, id(pm25_graph));
+            graph_y_start += graph_height + graph_spacing;
+            
+            it.printf(label_x, graph_y_start + graph_height/2, fl14, id(cyan), TextAlign::CENTER_LEFT, "CO2");
+            it.printf(label_x + 55, graph_y_start + 3, f_graph_label, id(white), TextAlign::TOP_LEFT, "%.1fk", 1500.0/1000.0);
+            it.printf(label_x + 54, graph_y_start + graph_height - 3, f_graph_label, id(white), TextAlign::BOTTOM_LEFT, "%.0f", 400.0);
+            it.graph(graph_x, graph_y_start, id(co2_graph));
+            graph_y_start += graph_height + graph_spacing;
+            
+            it.printf(label_x, graph_y_start + graph_height/2, fl14, id(orange), TextAlign::CENTER_LEFT, "VOC");
+            it.printf(label_x + 55, graph_y_start + 3, f_graph_label, id(white), TextAlign::TOP_LEFT, "%.0fk", 1000.0/1000.0);
+            it.printf(label_x + 55, graph_y_start + graph_height - 3, f_graph_label, id(white), TextAlign::BOTTOM_LEFT, "%.0f", 1.0);
+            it.graph(graph_x, graph_y_start, id(voc_graph));
+          } else { // 24 HOUR
+            it.printf(w/2, 2, fl14, id(white), TextAlign::TOP_CENTER, "LAST 24 HOURS");
+            graph_y_start = 20;
+            it.printf(label_x, graph_y_start + graph_height/2, fl14, id(blue), TextAlign::CENTER_LEFT, "TEMP");
+            it.printf(label_x + 55, graph_y_start + 3, f_graph_label, id(white), TextAlign::TOP_LEFT, "%.0f", 30.0);
+            it.printf(label_x + 55, graph_y_start + graph_height - 3, f_graph_label, id(white), TextAlign::BOTTOM_LEFT, "%.0f", 10.0);
+            it.graph(graph_x, graph_y_start, id(temperature_graph_24h));
+            graph_y_start += graph_height + graph_spacing;
+            
+            it.printf(label_x, graph_y_start + graph_height/2, fl14, id(green), TextAlign::CENTER_LEFT, "HUM");
+            it.printf(label_x + 55, graph_y_start + 3, f_graph_label, id(white), TextAlign::TOP_LEFT, "%.0f%%", 70.0);
+            it.printf(label_x + 55, graph_y_start + graph_height - 3, f_graph_label, id(white), TextAlign::BOTTOM_LEFT, "%.0f%%", 30.0);
+            it.graph(graph_x, graph_y_start, id(humidity_graph_24h));
+            graph_y_start += graph_height + graph_spacing;
+            
+            it.printf(label_x, graph_y_start + graph_height/2, fl14, id(yellow), TextAlign::CENTER_LEFT, "PM2.5");
+            it.printf(label_x + 55, graph_y_start + 3, f_graph_label, id(white), TextAlign::TOP_LEFT, "%.0f", 50.0);
+            it.printf(label_x + 55, graph_y_start + graph_height - 3, f_graph_label, id(white), TextAlign::BOTTOM_LEFT, "%.0f", 1.0);
+            it.graph(graph_x, graph_y_start, id(pm25_graph_24h));
+            graph_y_start += graph_height + graph_spacing;
+            
+            it.printf(label_x, graph_y_start + graph_height/2, fl14, id(cyan), TextAlign::CENTER_LEFT, "CO2");
+            it.printf(label_x + 55, graph_y_start + 3, f_graph_label, id(white), TextAlign::TOP_LEFT, "%.1fk", 1500.0/1000.0);
+            it.printf(label_x + 54, graph_y_start + graph_height - 3, f_graph_label, id(white), TextAlign::BOTTOM_LEFT, "%.0f", 400.0);
+            it.graph(graph_x, graph_y_start, id(co2_graph_24h));
+            graph_y_start += graph_height + graph_spacing;
+            
+            it.printf(label_x, graph_y_start + graph_height/2, fl14, id(orange), TextAlign::CENTER_LEFT, "VOC");
+            it.printf(label_x + 55, graph_y_start + 3, f_graph_label, id(white), TextAlign::TOP_LEFT, "%.0fk", 1000.0/1000.0);
+            it.printf(label_x + 55, graph_y_start + graph_height - 3, f_graph_label, id(white), TextAlign::BOTTOM_LEFT, "%.0f", 1.0);
+            it.graph(graph_x, graph_y_start, id(voc_graph_24h));
+          }
+      }
+
+      // Sensor Status Check
+      if (id(boot_millis) == 0) { id(boot_millis) = millis(); }
+      bool all_ready = (id(last_aht10_update) > 0) &&
+                       (id(last_bmp280_update) > 0) &&
+                       (id(last_scd4x_update) > 0) &&
+                       (id(last_sgp30_update) > 0) &&
+                       (id(last_pms_update) > 0);
+      float elapsed_sec = (millis() - (unsigned long)id(boot_millis)) / 1000.0f;
+
+      if (!all_ready) {
+        if (elapsed_sec < 90) {
+          it.print(w/2, (h * 3)/4 + 20, fl14, id(grey), TextAlign::BOTTOM_CENTER, "SensorBox starts up...");
+        } else {
+          std::string faulty_sensors = "";
+          if (id(last_aht10_update) == 0) faulty_sensors += "AHT10, ";
+          if (id(last_scd4x_update) == 0)  faulty_sensors += "SCD40, ";
+          if (id(last_sgp30_update) == 0)  faulty_sensors += "SGP30, ";
+          if (id(last_pms_update) == 0)    faulty_sensors += "PMS, ";
+
+          if (!faulty_sensors.empty()) {
+            faulty_sensors = faulty_sensors.substr(0, faulty_sensors.size() - 2);
+            char fault_msg[100];
+            sprintf(fault_msg, "Faulty sensors (%s)", faulty_sensors.c_str());
+            it.print(w/2, (h * 3)/4 + 20, fl14, id(red), TextAlign::BOTTOM_CENTER, fault_msg);
+            it.print(w/2, (h * 3)/4 + 40, fl14, id(red), TextAlign::BOTTOM_CENTER, "Please restart the device.");
+          }
+        }
+      }
+      
+      // Footer: Version mit Update-Indikator
+      it.printf(2, h - 2, fl14, id(grey), TextAlign::BOTTOM_LEFT, "SensorBox %s", ESPHOME_PROJECT_VERSION);
+      
+      // Update-Pfeil - KLEINER, NÄHER, langer Strich beginnt auf Schrifthöhe
+      if (id(update_available) && wifi_connected_status && !id(is_standalone_mode)) {
+        int version_text_width = strlen(ESPHOME_PROJECT_VERSION) * 8;
+        // Pfeil näher (2px statt 3px) und der lange Strich beginnt auf Schrifthöhe (h-2)
+        draw_update_arrow(2 + 80 + version_text_width + 2, h - 6, id(green));  
+      }
+
+      // WiFi Status / Standalone Mode text
+      if (id(is_standalone_mode)) {
+        it.print(w - 2, h - 2, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "Standalone");
+      } else {
+        if (wifi_connected_status) {
+          it.print(w - 2, h - 2, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "online");
+        } else {
+          it.print(w - 2, h - 2, fl14, id(grey), TextAlign::BOTTOM_RIGHT, "backup");
+        }
+      }
+
+      // WiFi Symbol
+      if (id(display_page) == 0 && !id(is_standalone_mode)) {
+        int wifi_x = w - 2; int wifi_y = h - 2; int bars = 0;
+        if (!wifi_connected_status) {
+          bars = 3;
+        } else {
+          float rssi_val = NAN; if(id(wifi_rssi).has_state()) rssi_val = id(wifi_rssi).state;
+          if (rssi_val > -50) { bars = 3; }
+          else if (rssi_val > -70) { bars = 2; }
+          else if (!isnan(rssi_val)) { bars = 1; }
+          else { bars = 0; }
+        }
+        int x_offset = wifi_connected_status ? 60 : 70;
+        if (bars > 0) { draw_big_wifi(wifi_x - x_offset, wifi_y - 5, id(grey), bars); }
+      }
+
+graph:
+  - id: temperature_graph
+    duration: 1h
+    x_grid: 10min
+    width: 151
+    height: 50
+    max_range: 30.0
+    min_range: 15.0
+    max_value: 30.0
+    min_value: 15.0
+    border: true
+    traces:
+      - sensor: temp_aht10
+        color: blue
+        line_type: SOLID
+        continuous: true
+        line_thickness: 2
+  - id: humidity_graph
+    duration: 1h
+    x_grid: 10min
+    width: 151
+    height: 50
+    max_range: 70.0
+    min_range: 30.0
+    max_value: 70.0
+    min_value: 30.0
+    border: true
+    traces:
+      - sensor: hum_aht10
+        color: green
+        line_type: SOLID
+        continuous: true
+        line_thickness: 2
+  - id: pm25_graph
+    duration: 1h
+    x_grid: 10min
+    width: 151
+    height: 50
+    max_range: 50.0
+    min_range: 1.0
+    max_value: 50.0
+    min_value: 1.0
+    border: true
+    traces:
+      - sensor: pm25_pms
+        color: yellow
+        line_type: SOLID
+        continuous: true
+        line_thickness: 2
+  - id: co2_graph
+    duration: 1h
+    x_grid: 10min
+    width: 151
+    height: 50
+    max_range: 1500.0
+    min_range: 400.0
+    max_value: 1500.0
+    min_value: 400.0
+    border: true
+    traces:
+      - sensor: co2_scd40
+        color: cyan
+        line_type: SOLID
+        continuous: true
+        line_thickness: 2
+  - id: voc_graph
+    duration: 1h
+    x_grid: 10min
+    width: 151
+    height: 50
+    max_range: 1000.0
+    min_range: 1.0
+    max_value: 1000.0
+    min_value: 1.0
+    border: true
+    traces:
+      - sensor: tvoc_sgp30
+        color: orange
+        line_type: SOLID
+        continuous: true
+        line_thickness: 2
+  - id: temperature_graph_24h
+    duration: 24h
+    x_grid: 4h
+    width: 151
+    height: 50
+    max_range: 30.0
+    min_range: 10.0
+    max_value: 30.0
+    min_value: 10.0
+    border: true
+    traces:
+      - sensor: temp_aht10
+        color: blue
+        line_type: SOLID
+        continuous: true
+        line_thickness: 2
+  - id: humidity_graph_24h
+    duration: 24h
+    x_grid: 4h
+    width: 151
+    height: 50
+    max_range: 70.0
+    min_range: 30.0
+    max_value: 70.0
+    min_value: 30.0
+    border: true
+    traces:
+      - sensor: hum_aht10
+        color: green
+        line_type: SOLID
+        continuous: true
+        line_thickness: 2
+  - id: pm25_graph_24h
+    duration: 24h
+    x_grid: 4h
+    width: 151
+    height: 50
+    max_range: 50.0
+    min_range: 1.0
+    max_value: 50.0
+    min_value: 1.0
+    border: true
+    traces:
+      - sensor: pm25_pms
+        color: yellow
+        line_type: SOLID
+        continuous: true
+        line_thickness: 2
+  - id: co2_graph_24h
+    duration: 24h
+    x_grid: 4h
+    width: 151
+    height: 50
+    max_range: 1500.0
+    min_range: 400.0
+    max_value: 1500.0
+    min_value: 400.0
+    border: true
+    traces:
+      - sensor: co2_scd40
+        color: cyan
+        line_type: SOLID
+        continuous: true
+        line_thickness: 2
+  - id: voc_graph_24h
+    duration: 24h
+    x_grid: 4h
+    width: 151
+    height: 50
+    max_range: 1000.0
+    min_range: 1.0
+    max_value: 1000.0
+    min_value: 1.0
+    border: true
+    traces:
+      - sensor: tvoc_sgp30
+        color: orange
+        line_type: SOLID
+        continuous: true
+        line_thickness: 2
+
+i2c:
+  - sda: GPIO11
+    scl: GPIO12
+    scan: true
+    id: i2c_main
+
+uart:
+  - tx_pin: GPIO08
+    rx_pin: GPIO07
+    baud_rate: 9600
+    id: uart_pms
+
+spi:
+  clk_pin: GPIO01
+  mosi_pin: GPIO02
+  miso_pin: GPIO16
